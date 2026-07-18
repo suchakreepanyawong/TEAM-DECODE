@@ -9,29 +9,31 @@
     🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑🔑
 ```
 
-# Auto Multibase Decode
+# TEAM-DECODE
 
 CRYPTO UTILITY — SECURE MULTIBASE DECODER 🔑  /   20+ encodings • smart heuristics • safe preview
 
-เครื่องมือ Python สำหรับถอดรหัสข้อความที่เข้ารหัสหรือบีบอัดซ้อนกันหลายชั้นในสไตล์ CTF/Cybersec
+เครื่องมือ Python สำหรับถอดรหัสข้อความที่เข้ารหัสหรือบีบอัดซ้อนกันหลายชั้นในสไตล์ CTF / Cybersec
 
 ## Overview
 
-`auto_multibase_decode.py` คือ utility ที่ออกแบบมาให้สามารถรับ input เป็นสตริง encoded หลายชั้น แล้วพยายามถอดกลับจนได้ plaintext ที่อ่านออกได้โดยอัตโนมัติ
+TEAM-DECODE.py คือ utility ที่ออกแบบมาเพื่อรับ input เป็นข้อความที่ถูกเข้ารหัสหรือบีบอัดหลายชั้น แล้วพยายามถอดกลับจนได้ plaintext ที่อ่านออกได้โดยอัตโนมัติ
 
 - รองรับการถอดแบบ multi-layer
-- ใช้ heuristics และ scoring เพื่อคัด candidate ที่เป็นไปได้มากที่สุด
-- ไม่ต้องรู้ล่วงหน้าว่า encoder ไหนถูกใช้
+- ใช้ heuristics และ scoring เพื่อคัด candidate ที่มีโอกาสเป็น plaintext มากที่สุด
+- ไม่ต้องรู้ล่วงหน้าว่า encoder หรือ compression format ไหนถูกใช้
 - เหมาะสำหรับงาน CTF, reverse engineering, forensic และ pentest
 
-## Features
+## Features ใหม่
 
-- รองรับ encoding/decoding หลายรูปแบบ
-- รองรับ compression format ยอดนิยม
-- ระบบ scoring อัจฉริยะที่ชั่งน้ำหนักความเป็นไปได้
-- Beam search เพื่อค้นหา chain ที่ยาวอย่างมีประสิทธิภาพ
-- โหมด interactive CLI
-- `--show-candidates` เพื่อดู candidate อันดับต้น
+- รองรับการถอดแบบอัตโนมัติหลายชั้นแบบเรียงลำดับ candidate
+- รองรับ encoding/decoding มากกว่า 20 รูปแบบ
+- รองรับ compression format ยอดนิยม เช่น gzip, zlib, bzip2, xz, zstd
+- รองรับ base100, quoted-printable, xor single-byte, reverse, rot47 และ atbash
+- มีโหมด interactive CLI สำหรับใช้งานแบบสด ๆ
+- มีคำสั่ง manual สำหรับ railfence, vigenere และ columnar
+- มีตัวเลือก `--show-candidates` เพื่อดู candidate อันดับต้นแบบละเอียด
+- มีระบบ scoring และ bonus ที่ช่วยให้ผลลัพธ์ที่เป็น flag-style น่าเชื่อถือขึ้น
 
 ## Supported Encoding Schemes
 
@@ -46,6 +48,7 @@ CRYPTO UTILITY — SECURE MULTIBASE DECODER 🔑  /   20+ encodings • smart he
 - `base62`
 - `base64`
 - `base64url`
+- `base100`
 
 ### High-radix / ASCII encodings
 - `base85`
@@ -64,9 +67,17 @@ CRYPTO UTILITY — SECURE MULTIBASE DECODER 🔑  /   20+ encodings • smart he
 ### Text / Substitution
 - `morse`
 - `url`
+- `quoted_printable`
 - `rotN` / all ROT shifts
 - `rot47`
 - `atbash`
+- `xor_singlebyte`
+- `reverse`
+
+### Manual Commands
+- `railfence <rails> <text>`
+- `vigenere <key> <text>`
+- `columnar <width> <text>`
 
 ## Installation
 
@@ -85,31 +96,31 @@ python -m pip install zstandard
 ### Run interactive mode
 
 ```bash
-python auto_multibase_decode.py
+python TEAM-DECODE.py
 ```
 
 ### Decode from command line
 
 ```bash
-python auto_multibase_decode.py "<encoded string>"
+python TEAM-DECODE.py "<encoded string>"
 ```
 
 ### Read from file
 
 ```bash
-python auto_multibase_decode.py -f encoded.txt
+python TEAM-DECODE.py -f encoded.txt
 ```
 
 ### ปรับความลึกและ beam size
 
 ```bash
-python auto_multibase_decode.py "<encoded string>" -m 15 -b 320
+python TEAM-DECODE.py "<encoded string>" -m 15 -b 320
 ```
 
 ### แสดง candidate เพิ่มเติม
 
 ```bash
-python auto_multibase_decode.py "<encoded string>" --show-candidates
+python TEAM-DECODE.py "<encoded string>" --show-candidates
 ```
 
 ## Magic Mode
@@ -119,52 +130,14 @@ python auto_multibase_decode.py "<encoded string>" --show-candidates
 - ให้โบนัสกับข้อความที่มีลักษณะ `CTF{...}` และคำสำคัญทางความปลอดภัย
 - ให้คะแนนสูงขึ้นกับสตริงที่มีตัวอักษร+ตัวเลขพร้อม `_`, `-`, `{`, `}`
 - ลดน้ำหนัก chain ที่ไม่ใช่ plaintext ยาว ๆ แต่ไม่มี structure
-- เรียงลำดับ decoder แบบ base64/base32/url ก่อน เพื่อจับลำดับ decoding ที่เป็นไปได้มากที่สุด
+- ปรับแต่งกลไกให้ชอบ chain ที่มีโอกาสเป็น flag แบบ multi-layer มากขึ้น
+- ควบคุมการใช้ substitution-heavy chain ให้ไม่ลุกลามเกินไป
 
 ## Notes
 
 - ผลลัพธ์ขึ้นอยู่กับค่าพารามิเตอร์ `max_depth` และ `beam_size`
 - ถ้าต้องการจัดการ chain ยาว ๆ ให้เพิ่ม `-m` และ `-b`
-- ระบบนี้ออกแบบมาให้เสถียร ไม่เพิ่ม XOR หรือ brute-force แบบไม่จำกัด
-
-### Decode from command line
-
-```bash
-python auto_multibase_decode.py "<encoded string>"
-```
-
-### Read from file
-
-```bash
-python auto_multibase_decode.py -f encoded.txt
-```
-
-### Adjust depth and beam size
-
-```bash
-python auto_multibase_decode.py "<encoded string>" -m 15 -b 320
-```
-
-### Show more candidates
-
-```bash
-python auto_multibase_decode.py "<encoded string>" --show-candidates
-```
-
-## Magic Mode
-
-"Magic Mode" refers to the set of heuristics aimed at improving detection of typical CTF/cyber patterns:
-
-- Bonus awarded for recognizable CTF flag patterns like `CTF{...}` and security-related keywords
-- Higher score for strings containing mixed alphanumeric patterns with `_`, `-`, `{`, `}`
-- Penalize long chains that produce unstructured plaintext-like outputs
-- Prioritize decoders such as `base64`/`base32`/`url` early in the decode order to discover likely decoding paths
-
-## Notes
-
-- Results depend on the `max_depth` and `beam_size` parameters.
-- For longer or deeper chains, increase `-m` and `-b` to explore more possibilities.
-- This tool deliberately avoids adding brute-force XOR or unlimited brute-force methods.
+- ระบบนี้ออกแบบมาให้เสถียร และมุ่งเน้นการค้นหาคำตอบที่เป็นไปได้มากกว่า brute-force แบบไม่จำกัด
 
 ## License
 
