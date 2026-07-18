@@ -127,18 +127,6 @@ python auto_multibase_decode.py "<encoded string>" --show-candidates
 - ถ้าต้องการจัดการ chain ยาว ๆ ให้เพิ่ม `-m` และ `-b`
 - ระบบนี้ออกแบบมาให้เสถียร ไม่เพิ่ม XOR หรือ brute-force แบบไม่จำกัด
 
-```
-
-`zstandard` is optional — the tool runs without it but will skip zstd decompression.
-
-## Usage
-
-### Run interactive mode
-
-```bash
-python auto_multibase_decode.py
-```
-
 ### Decode from command line
 
 ```bash
