@@ -129,10 +129,10 @@ python auto_multibase_decode.py "<encoded string>" --show-candidates
 
 ## License
 
-This project is provided under the `MIT License`.
+This project is provided under the `(SPT) License`.
 
 ```
-MIT License
+(SPT) License
 
 Copyright (c) 2026
 
