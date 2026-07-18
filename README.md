@@ -154,9 +154,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
-
-## Recommended GitHub Setup
-
-- ตั้งค่า repository เป็น `private`
-- เพิ่ม `README.md` นี้เป็นเอกสารหลัก
-- ถ้าต้องการ share ภายในทีม ให้สร้าง `CONTRIBUTING.md` หรือ `ISSUE_TEMPLATE` เพิ่มในภายหลัง
