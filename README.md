@@ -129,10 +129,137 @@ python auto_multibase_decode.py "<encoded string>" --show-candidates
 
 ## License
 
-This project is provided under the `(SPT) License`.
+This project is provided under the `SPT License`.
 
 ```
-(SPT) License
+SPT License
+
+Copyright (c) 2026
+
+ # Auto Multibase Decode
+
+CRYPTO UTILITY — SECURE MULTIBASE DECODER 🔑  /   20+ encodings • smart heuristics • safe preview
+
+Python tool to automatically decode multi-layer encoded and compressed strings commonly seen in CTF and cyber/security workflows.
+
+## Overview
+
+`auto_multibase_decode.py` is a utility designed to accept an input string that may be encoded and/or compressed across multiple layers and attempt to recover a human-readable plaintext automatically.
+
+- Multi-layer decoding support
+- Heuristics and scoring to rank likely plaintext candidates
+- No prior knowledge required of which encoders were used
+- Suitable for CTFs, reverse engineering, forensics, and penetration testing
+
+## Features
+
+- Wide support for encodings and decoders
+- Common compression formats supported
+- Smart scoring engine to rate candidate plaintexts
+- Beam search to explore multi-step decode chains efficiently
+- Interactive CLI mode
+- `--show-candidates` to inspect top-scoring candidates
+
+## Supported Encoding Schemes
+
+### Base / Radix
+- `base2`
+- `base16`
+- `base32` (standard + forgiving separators + unpadded)
+- `base32hex`
+- `base36`
+- `base45`
+- `base58`
+- `base62`
+- `base64`
+- `base64url`
+
+### High-radix / ASCII encodings
+- `base85`
+- `ascii85`
+- `z85`
+- `base91`
+- `base92`
+
+### Compression
+- `gzip`
+- `zlib`
+- `bzip2`
+- `xz`
+- `zstd` (optional)
+
+### Text / Substitution
+- `morse`
+- `url`
+- `rotN` / all ROT shifts
+- `rot47`
+- `atbash`
+
+## Installation
+
+1. Clone or copy the files into your repository.
+2. Use Python 3.11+ (Python 3.13 recommended).
+3. Install the optional `zstandard` dependency if you want zstd support:
+
+```bash
+python -m pip install zstandard
+```
+
+`zstandard` is optional — the tool runs without it but will skip zstd decompression.
+
+## Usage
+
+### Run interactive mode
+
+```bash
+python auto_multibase_decode.py
+```
+
+### Decode from command line
+
+```bash
+python auto_multibase_decode.py "<encoded string>"
+```
+
+### Read from file
+
+```bash
+python auto_multibase_decode.py -f encoded.txt
+```
+
+### Adjust depth and beam size
+
+```bash
+python auto_multibase_decode.py "<encoded string>" -m 15 -b 320
+```
+
+### Show more candidates
+
+```bash
+python auto_multibase_decode.py "<encoded string>" --show-candidates
+```
+
+## Magic Mode
+
+"Magic Mode" refers to the set of heuristics aimed at improving detection of typical CTF/cyber patterns:
+
+- Bonus awarded for recognizable CTF flag patterns like `CTF{...}` and security-related keywords
+- Higher score for strings containing mixed alphanumeric patterns with `_`, `-`, `{`, `}`
+- Penalize long chains that produce unstructured plaintext-like outputs
+- Prioritize decoders such as `base64`/`base32`/`url` early in the decode order to discover likely decoding paths
+
+## Notes
+
+- Results depend on the `max_depth` and `beam_size` parameters.
+- For longer or deeper chains, increase `-m` and `-b` to explore more possibilities.
+- This tool deliberately avoids adding brute-force XOR or unlimited brute-force methods.
+
+## License
+
+This project is provided under the `SPT License`.
+
+```
+SPT License
 
 Copyright (c) 2026
 
@@ -154,3 +281,4 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
