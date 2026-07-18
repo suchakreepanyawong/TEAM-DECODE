@@ -38,6 +38,15 @@ ENGLISH_LETTER_FREQ = {
     "q": 0.10, "z": 0.07,
 }
 
+def _log_debug(msg: str) -> None:
+    # Non-invasive debug logger: enabled by setting DEBUG_AUTO_DECODE=1
+    try:
+        if os.environ.get("DEBUG_AUTO_DECODE"):
+            print(msg, file=sys.stderr)
+    except Exception:
+        # never raise from logging
+        pass
+
 def english_chi_squared(text: str) -> float | None:
     letters = [ch.lower() for ch in text if ch.isalpha()]
     n = len(letters)
@@ -59,6 +68,20 @@ DEFAULT_MAX_DEPTH = 15
 DEFAULT_BEAM_SIZE = 320
 DEFAULT_CANDIDATE_COUNT = 5
 MAX_CONSECUTIVE_SUBSTITUTION = 2
+# Caps the *total* number of substitution-family steps (rot*/atbash/
+# xor_singlebyte) allowed anywhere in a chain, not just consecutively.
+# MAX_CONSECUTIVE_SUBSTITUTION alone resets after any Tier-1 step, so a
+# chain like rot->rot47->reverse->url->rot->rot47->reverse->... could
+# accumulate substitution steps without bound. Since these schemes always
+# "succeed" (never fail to produce *some* output), an unbounded total lets
+# beam search reach an astronomically large set of garbage strings - large
+# enough that even a tightened Tier-1 guard (see decode_quoted_printable /
+# decode_url) eventually matches one by pure chance and wins on score.
+# Every combo-chain test case we have uses at most 2 total substitution
+# steps, so 3 leaves headroom without reopening the garbage-chain problem.
+MAX_TOTAL_SUBSTITUTION = 3
+ALWAYS_SUCCEEDS_STEP_PENALTY = 2.0
+FLAG_FOUND_OVERRIDE_BONUS = 100.0
 
 BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 BASE45_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
@@ -73,6 +96,13 @@ BASE92_ALPHABET = (
     "!#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
     "abcdefghijklmnopqrstuvwxyz{|}"
 )
+
+# Base100 (Base๐Ÿ’ฏ): each byte 0-255 maps 1:1 to a codepoint in
+# U+1F3F7 ..= U+1F4F6 (256 codepoints total). Fully deterministic:
+# a string is valid Base100 iff every character's codepoint falls in
+# that exact range, so there is zero ambiguity -> safe to auto-chain.
+BASE100_START = 0x1F3F7
+BASE100_END = 0x1F4F6  # inclusive
 
 @dataclass(frozen=True)
 class Candidate:
@@ -132,7 +162,8 @@ def decode_base32(value: str) -> str | None:
             unq = urllib.parse.unquote(compact)
             if unq and unq != compact:
                 compact = unq
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_base32: unquote failed: {e!r}")
             pass
 
     s = compact.upper().rstrip('=')
@@ -158,7 +189,8 @@ def decode_base32(value: str) -> str | None:
             decoded = bytes_to_text(base64.b32decode(pad32(alt), casefold=True))
             if decoded is not None:
                 return decoded
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_base32: forgiving variant failed: {e!r}")
             pass
 
     # Try base32hex (RFC 4648 "extended hex") by translating alphabet
@@ -171,7 +203,8 @@ def decode_base32(value: str) -> str | None:
             decoded = bytes_to_text(base64.b32decode(pad32(mapped), casefold=True))
             if decoded is not None:
                 return decoded
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_base32: base32hex mapping failed: {e!r}")
             pass
 
     return None
@@ -346,6 +379,58 @@ def decode_base92(value: str) -> str | None:
     except (OverflowError, KeyError, ValueError):
         return None
 
+def decode_base100(value: str) -> str | None:
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) < 2:
+        return None
+    codepoints = [ord(ch) for ch in compact]
+    if not all(BASE100_START <= cp <= BASE100_END for cp in codepoints):
+        return None
+    try:
+        raw = bytes(cp - BASE100_START for cp in codepoints)
+    except ValueError:
+        return None
+    return bytes_to_text(raw)
+
+def decode_quoted_printable(value: str) -> str | None:
+    # Tightened guard: a single stray "=XX" is common by pure chance once a
+    # string has been scrambled by rot47/xor/reverse (lots of punctuation +
+    # hex-ish digits floating around), so a single match is NOT a reliable
+    # signal on its own - it was letting garbage chains masquerade as a
+    # "validated" Tier-1 decode and grab VALIDATED_DECODE_BONUS for free.
+    # Now we require either a soft line-break (unambiguous QP-only syntax)
+    # or a minimum *density* of "=XX" escapes relative to length, so a
+    # short/sparse coincidental match no longer qualifies.
+    if "=" not in value:
+        return None
+    has_soft_break = "=\n" in value or "=\r\n" in value
+    escape_matches = re.findall(r"=[0-9A-Fa-f]{2}", value)
+    if not has_soft_break:
+        if len(escape_matches) < 3:
+            return None
+    try:
+        import quopri
+        raw = quopri.decodestring(value.encode("latin-1", errors="ignore"))
+    except Exception as e:
+        _log_debug(f"decode_quoted_printable: failed: {e!r}")
+        return None
+    decoded = bytes_to_text(raw)
+    if not decoded or decoded == value:
+        return None
+    # Extra sanity: the decode should not have made things *less* printable
+    # than the input - a real QP payload decodes into cleaner text, not
+    # noisier text.
+    if mostly_binary(decoded):
+        return None
+    return decoded
+
+def decode_reverse(value: str) -> str | None:
+    compact = value.strip()
+    if len(compact) < 4 or mostly_binary(compact):
+        return None
+    reversed_text = compact[::-1]
+    return reversed_text if reversed_text != compact else None
+
 def decode_morse(value: str) -> str | None:
     table = {
         ".-": "A", "-...": "B", "-.-.": "C", "-..": "D", ".": "E", "..-.": "F",
@@ -373,134 +458,150 @@ def decode_url(value: str) -> str | None:
     compact = value.strip()
     if "%" not in compact and "+" not in compact:
         return None
-    if not re.search(r"%[0-9A-Fa-f]{2}", compact):
+    escape_matches = re.findall(r"%[0-9A-Fa-f]{2}", compact)
+    if not escape_matches:
         return None
+    # Same rationale as decode_quoted_printable: a single stray "%XX" is
+    # common by chance in strings that have been through rot47/xor/reverse
+    # (plenty of "%" and hex-ish digits float around), so one match alone
+    # is not a trustworthy signal. Require either multiple escapes or a
+    # minimum density relative to length before treating this as genuine
+    # percent-encoding.
+    if len(escape_matches) < 2:
+        density = len(escape_matches) * 3 / max(len(compact), 1)
+        if density < 0.15:
+            return None
     try:
         decoded = urllib.parse.unquote(compact, errors="strict")
     except (UnicodeDecodeError, ValueError):
         return None
-    return decoded if decoded != compact else None
+    if not decoded or decoded == compact:
+        return None
+    if mostly_binary(decoded):
+        return None
+    return decoded
 
 def decode_gzip(value: str) -> str | None:
     compact = re.sub(r"\s+", "", value)
-    # try hex
     if re.fullmatch(r"[0-9A-Fa-f]+", compact) and len(compact) % 2 == 0:
         try:
             raw = bytes.fromhex(compact)
             out = gzip.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_gzip: hex path failed: {e!r}")
             pass
 
-    # try base64
     if re.fullmatch(r"[A-Za-z0-9+/]+=*", compact):
         try:
             raw = base64.b64decode(add_base64_padding(compact))
             out = gzip.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_gzip: base64 path failed: {e!r}")
             pass
 
-    # try raw bytes (latin-1 passthrough)
     try:
         raw = value.encode("latin-1")
         out = gzip.decompress(raw)
         return bytes_to_text(out)
-    except Exception:
+    except Exception as e:
+        _log_debug(f"decode_gzip: raw bytes path failed: {e!r}")
         return None
 
 def decode_zlib(value: str) -> str | None:
     compact = re.sub(r"\s+", "", value)
-    # try hex
     if re.fullmatch(r"[0-9A-Fa-f]+", compact) and len(compact) % 2 == 0:
         try:
             raw = bytes.fromhex(compact)
-            # try zlib wrapper first
             try:
                 out = zlib.decompress(raw)
                 return bytes_to_text(out)
-            except Exception:
-                # try raw DEFLATE
+            except Exception as e:
+                _log_debug(f"decode_zlib: zlib wrapper failed, trying raw DEFLATE: {e!r}")
                 out = zlib.decompress(raw, wbits=-15)
                 return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_zlib: hex path failed: {e!r}")
             pass
 
-    # try base64
     if re.fullmatch(r"[A-Za-z0-9+/]+=*", compact):
         try:
             raw = base64.b64decode(add_base64_padding(compact))
             try:
                 out = zlib.decompress(raw)
                 return bytes_to_text(out)
-            except Exception:
+            except Exception as e:
+                _log_debug(f"decode_zlib: zlib wrapper (base64) failed, trying raw DEFLATE: {e!r}")
                 out = zlib.decompress(raw, wbits=-15)
                 return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_zlib: base64 path failed: {e!r}")
             pass
 
-    # try raw bytes
     try:
         raw = value.encode("latin-1")
         try:
             out = zlib.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_zlib: zlib wrapper (raw) failed, trying raw DEFLATE: {e!r}")
             out = zlib.decompress(raw, wbits=-15)
             return bytes_to_text(out)
-    except Exception:
+    except Exception as e:
+        _log_debug(f"decode_zlib: raw bytes path failed: {e!r}")
         return None
 
 def decode_bzip2(value: str) -> str | None:
     compact = re.sub(r"\s+", "", value)
-    # try hex
     if re.fullmatch(r"[0-9A-Fa-f]+", compact) and len(compact) % 2 == 0:
         try:
             raw = bytes.fromhex(compact)
             out = bz2.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_bzip2: hex path failed: {e!r}")
             pass
-    # try base64
     if re.fullmatch(r"[A-Za-z0-9+/]+=*", compact):
         try:
             raw = base64.b64decode(add_base64_padding(compact))
             out = bz2.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_bzip2: base64 path failed: {e!r}")
             pass
-    # raw bytes
     try:
         raw = value.encode("latin-1")
         out = bz2.decompress(raw)
         return bytes_to_text(out)
-    except Exception:
+    except Exception as e:
+        _log_debug(f"decode_bzip2: raw bytes path failed: {e!r}")
         return None
 
 def decode_xz(value: str) -> str | None:
     compact = re.sub(r"\s+", "", value)
-    # try hex
     if re.fullmatch(r"[0-9A-Fa-f]+", compact) and len(compact) % 2 == 0:
         try:
             raw = bytes.fromhex(compact)
             out = lzma.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_xz: hex path failed: {e!r}")
             pass
-    # try base64
     if re.fullmatch(r"[A-Za-z0-9+/]+=*", compact):
         try:
             raw = base64.b64decode(add_base64_padding(compact))
             out = lzma.decompress(raw)
             return bytes_to_text(out)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_xz: base64 path failed: {e!r}")
             pass
-    # raw bytes
     try:
         raw = value.encode("latin-1")
         out = lzma.decompress(raw)
         return bytes_to_text(out)
-    except Exception:
+    except Exception as e:
+        _log_debug(f"decode_xz: raw bytes path failed: {e!r}")
         return None
 
 def decode_zstd(value: str) -> str | None:
@@ -508,25 +609,53 @@ def decode_zstd(value: str) -> str | None:
         return None
     compact = re.sub(r"\s+", "", value)
     try:
-        # try hex
         if re.fullmatch(r"[0-9A-Fa-f]+", compact) and len(compact) % 2 == 0:
             raw = bytes.fromhex(compact)
             dctx = zstd.ZstdDecompressor()
             out = dctx.decompress(raw)
             return bytes_to_text(out)
-        # try base64
         if re.fullmatch(r"[A-Za-z0-9+/]+=*", compact):
             raw = base64.b64decode(add_base64_padding(compact))
             dctx = zstd.ZstdDecompressor()
             out = dctx.decompress(raw)
             return bytes_to_text(out)
-        # try raw
         raw = value.encode("latin-1")
         dctx = zstd.ZstdDecompressor()
         out = dctx.decompress(raw)
         return bytes_to_text(out)
-    except Exception:
+    except Exception as e:
+        _log_debug(f"decode_zstd: decompression failed: {e!r}")
         return None
+
+def decode_xor_singlebyte(value: str) -> str | None:
+    compact = re.sub(r"\s+", "", value)
+    raw = None
+    if re.fullmatch(r"[0-9A-Fa-f]+", compact) and len(compact) % 2 == 0 and len(compact) >= 6:
+        try:
+            raw = bytes.fromhex(compact)
+        except ValueError:
+            raw = None
+    if raw is None and re.fullmatch(r"[A-Za-z0-9+/]+=*", compact) and len(compact) >= 8:
+        try:
+            raw = base64.b64decode(add_base64_padding(compact), validate=True)
+        except (binascii.Error, ValueError):
+            raw = None
+    if raw is None or len(raw) < 4:
+        return None
+
+    best_text, best_score = None, -999.0
+    for key in range(1, 256):
+        candidate = bytes(b ^ key for b in raw)
+        text = bytes_to_text(candidate)
+        if text is None:
+            continue
+        s = score_text(text)
+        if s > best_score:
+            best_text, best_score = text, s
+
+    if best_text is not None and best_score >= 6.0:
+        return best_text
+    return None
 
 DECODERS: tuple[tuple[str, Callable[[str], str | None]], ...] = (
     ("base64", decode_base64),
@@ -534,12 +663,14 @@ DECODERS: tuple[tuple[str, Callable[[str], str | None]], ...] = (
     ("base32", decode_base32),
     ("base16", decode_base16),
     ("base2", decode_base2),
+    ("base100", decode_base100),
     ("gzip", decode_gzip),
     ("zlib", decode_zlib),
     ("bzip2", decode_bzip2),
     ("xz", decode_xz),
     ("zstd", decode_zstd),
     ("url", decode_url),
+    ("quoted_printable", decode_quoted_printable),
     ("base45", decode_base45),
     ("base85", decode_base85),
     ("ascii85", decode_ascii85),
@@ -550,6 +681,8 @@ DECODERS: tuple[tuple[str, Callable[[str], str | None]], ...] = (
     ("base36", decode_base36),
     ("base58", decode_base58),
     ("base62", decode_base62),
+    ("xor_singlebyte", decode_xor_singlebyte),
+    ("reverse", decode_reverse),
 )
 
 def looks_like_rotatable_text(text: str) -> bool:
@@ -571,12 +704,6 @@ def rot_n(text: str, shift: int) -> str:
     return "".join(out)
 
 def decode_rot_all(value: str) -> list[tuple[str, str]]:
-    # หมายเหตุเรื่องการตั้งชื่อ: shift ที่ใช้ "ถอด" (บวกเพื่อย้อนกลับ) กับ
-    # shift ที่คนใช้ "เข้ารหัส" ไม่ใช่ตัวเดียวกัน — เข้ารหัสด้วย ROT-S (บวก S)
-    # ต้องถอดด้วยการบวก (26-S) mod 26 ไม่ใช่ S เอง ถ้าเราถอดสำเร็จตอน
-    # shift=K แปลว่าตอนเข้ารหัสจริงๆ ใช้ shift=(26-K) mod 26 — ต้องโชว์ชื่อ
-    # chain เป็นเลข shift ตอน "เข้ารหัส" (26-K) เพราะนั่นคือเลขที่คนพิมพ์ใส่
-    # เครื่องมือเข้ารหัสจริง ไม่ใช่เลข K ที่เราบวกเพื่อย้อนกลับ
     if not looks_like_rotatable_text(value):
         return []
     results = []
@@ -626,26 +753,41 @@ SUBSTITUTION_DECODERS: tuple[tuple[str, Callable[[str], str | None]], ...] = (
 )
 
 def is_substitution_scheme(name: str) -> bool:
-    return name.startswith("rot") or name == "atbash"
+    return name.startswith("rot") or name in {"atbash", "xor_singlebyte"}
 
-# โบนัสสำหรับ decoder ที่ "fail ได้จริง" (กลุ่ม DECODERS: base*, morse, url)
-# ต่างจาก ROT/atbash ที่ decode สำเร็จเสมอไม่มีทางล้มเหลว การที่ decoder
-# กลุ่มนี้ผ่าน validation ได้ (charset ถูกต้องเป๊ะ, padding/bit-alignment
-# ลงตัว ฯลฯ) คือสัญญาณที่เชื่อถือได้ว่ากำลังเดินถูกทาง แม้ผลลัพธ์ที่ได้จะยัง
-# ไม่ใช่ plaintext ที่อ่านออก (เช่น base92 ที่ต้องถอด base58/base32 ต่ออีก)
-# ก็ตาม ถ้าไม่ให้โบนัสนี้ ผลลัพธ์ระดับกลางแบบนี้จะแพ้ให้กับสตริงที่ถูก
-# rot/atbash สับไปเรื่อยๆ ซึ่งบังเอิญยังมีหน้าตาเป็นตัวอักษรอยู่ (คะแนน
-# printable/alpha ใกล้เคียงกัน) ทั้งที่ไม่ได้นำไปสู่คำตอบจริงเลย
+def is_always_succeeds_scheme(name: str) -> bool:
+    # rot*/atbash/xor_singlebyte/reverse all share the property that they
+    # essentially never fail on any long-enough input (unlike base64/gzip/
+    # etc, which reject malformed input). Treated together for the purpose
+    # of capping total chain length, since any of them can multiply the
+    # reachable garbage-string space the same way.
+    return is_substitution_scheme(name) or name == "reverse"
+
 VALIDATED_DECODE_BONUS = 8.0
 
-# base36/base58/base62 ไม่มี padding หรือ checksum ใดๆ เลย — มันแค่ตีความ
-# สตริงที่อยู่ใน alphabet ของมันเป็นเลขจำนวนเต็มตัวใหญ่ ดังนั้น "แทบทุก"
-# สตริงตัวอักษร/ตัวเลขสั้นๆ จะ "valid" เสมอ (คล้าย ROT ที่ไม่มีวันล้มเหลว)
-# ถ้าให้โบนัสด้วยจะกลายเป็นช่องโหว่ใหม่: string สุ่มที่ไม่เกี่ยวอะไรเลย
-# จะได้ +4 ฟรีๆ แค่เพราะมันบังเอิญเป็นตัวอักษร/ตัวเลข จึงต้องกันสามตัวนี้
-# ออกจากรายการที่ได้โบนัส (ยังใช้เป็น candidate ในการค้นหาได้ตามปกติ
-# เพียงแต่ไม่ได้อภิสิทธิ์คะแนนพิเศษ)
-WEAK_VALIDATION_SCHEMES = {"base36", "base58", "base62"}
+WEAK_VALIDATION_SCHEMES = {"base36", "base58", "base62", "reverse"}
+
+# quoted_printable/url are still Tier-1 (they can genuinely fail, unlike
+# ROT/atbash which always "succeed"). But their guards are loose enough
+# that they can coincidentally fire on garbage produced by long rot/xor/
+# reverse chains. Real payloads almost never need QP or url-decode applied
+# twice in the same chain, so capping each to one use per chain closes off
+# the main way a fake chain could repeatedly "refuel" on
+# VALIDATED_DECODE_BONUS.
+ONCE_PER_CHAIN_SCHEMES = {"quoted_printable", "url"}
+
+# base2/base16/ascii85/base85/z85/base91/base92 all use either a tiny
+# alphabet (base2: just 0/1, base16: just hex digits) or a very *wide*
+# alphabet that covers nearly the full printable ASCII range (ascii85/
+# base85/z85/base91/base92). Both extremes mean a short random-looking
+# string is quite likely to "validate" against them purely by chance -
+# confirmed empirically: plain-English rot13 test sentences kept losing
+# to coincidental ascii85/base16 decodes of scrambled intermediate text
+# that were only 10-20 characters long. A real payload encoded in one of
+# these formats is essentially never this short in practice, so require a
+# minimum decoded length before trusting the "reliable decoder" bonus.
+DENSE_LOW_CONFIDENCE_SCHEMES = {"base2", "base16", "ascii85", "base85", "z85", "base91", "base92"}
+MIN_LENGTH_FOR_DENSE_BONUS = 18
 
 def gets_validated_bonus(scheme: str) -> bool:
     return not is_substitution_scheme(scheme) and scheme not in WEAK_VALIDATION_SCHEMES
@@ -653,22 +795,20 @@ def gets_validated_bonus(scheme: str) -> bool:
 def trailing_substitution_run(chain: tuple[str, ...]) -> int:
     count = 0
     for scheme in reversed(chain):
-        if is_substitution_scheme(scheme):
+        if is_always_succeeds_scheme(scheme):
             count += 1
         else:
             break
     return count
+
+def total_substitution_count(chain: tuple[str, ...]) -> int:
+    return sum(1 for scheme in chain if is_always_succeeds_scheme(scheme))
 
 def has_boundaried_token(text: str, word: str) -> bool:
     for match in re.finditer(re.escape(word), text, re.IGNORECASE):
         token = match.group()
         start, end = match.start(), match.end()
         if token.isupper():
-            # ตัวพิมพ์ใหญ่ล้วน (เช่น "CTF" ใน "TeammerCTFF") ถือเป็น token
-            # ที่เด่นชัดในตัวเองอยู่แล้ว แค่เช็คว่าไม่ได้ต่อเนื่องมาจากตัว
-            # พิมพ์เล็กก่อนหน้า (ถ้าใช่ = camelCase boundary ที่ต้องการ)
-            # ไม่ต้องสนใจว่าหลังจากนี้จะมีอะไรต่อ (อาจมีตัวพิมพ์ใหญ่ต่อ
-            # อีกได้ เช่น "CTFF" ก็ยังนับเป็น token เดียวกัน)
             before_ok = (
                 start == 0
                 or not text[start - 1].isalnum()
@@ -682,6 +822,15 @@ def has_boundaried_token(text: str, word: str) -> bool:
         if before_ok and after_ok:
             return True
     return False
+
+FULL_FLAG_PATTERN = re.compile(r"\b[A-Za-z0-9_]{2,20}\{[^{}]{1,200}\}")
+
+def has_full_flag_pattern(text: str) -> bool:
+    match = FULL_FLAG_PATTERN.search(text)
+    if not match:
+        return False
+    tag = match.group().split("{", 1)[0].lower()
+    return "flag" in tag or "ctf" in tag or "picoctf" in tag or "htb" in tag
 
 def shannon_entropy(text: str) -> float:
     if not text:
@@ -703,41 +852,26 @@ def score_text(text: str) -> float:
     if re.search(r"(flag|ctf)[\{_\-:]", lower):
         flag_bonus = 10.0
     elif has_boundaried_token(text, "ctf") or has_boundaried_token(text, "flag"):
-        # โผล่มาแบบมีขอบเขตจริง (แยกด้วยอักขระที่ไม่ใช่ตัวอักษร/ตัวเลข หรือ
-        # เป็นรอยต่อ camelCase เช่น "...merCTF") น่าเชื่อกว่าการเจอเป็น
-        # substring ลอยๆ กลางคำ (เช่น "...rctfa..." ซึ่งเกิดจาก ROT shift
-        # ผิดได้ง่ายๆ โดยบังเอิญ) จึงยังให้คะแนนได้ แต่ไม่มากเท่าที่มี
-        # delimiter ชัดเจนแบบ flag{...}
         flag_bonus = 3.0
 
     entropy = shannon_entropy(text)
     entropy_penalty = abs(entropy - 4.2) * 0.5
-    length_bonus = min(len(text), 80) / 80
-
-    if " " not in text and len(text) > 20 and word_bonus == 0 and ctf_style_bonus == 0:
-        length_bonus = -3.0
 
     ctf_style_bonus = 0.0
     if any(ch.isdigit() for ch in text) and any(ch.isalpha() for ch in text):
         if "_" in text or "{" in text or "}" in text or "-" in text:
             ctf_style_bonus = 2.0
-
     if any(ch.isdigit() for ch in text) and any(ch.isalpha() for ch in text) and "_" in text:
         ctf_style_bonus = max(ctf_style_bonus, 2.5)
 
-    # chi-squared penalty: ยิ่งการกระจายตัวของตัวอักษรใกล้เคียงภาษาอังกฤษ
-    # ปกติ (E มากสุด, Z น้อยสุด ฯลฯ) ยิ่ง chi2 ต่ำ ยิ่งน่าเชื่อว่าเป็นข้อความ
-    # จริง ส่วนสตริงสุ่ม/ยังไม่ถอด หรือ ROT shift ผิด จะมีการกระจายตัวเพี้ยน
-    # ไปจากธรรมชาติของภาษาอังกฤษ ทำให้ chi2 สูงกว่ามาก ตัวหารคงที่ (140) ถูก
-    # ปรับจากการทดสอบจริงเพื่อไม่ให้กลบคะแนนจาก word_bonus/flag_bonus
+    length_bonus = min(len(text), 80) / 80
+    if " " not in text and len(text) > 20 and word_bonus == 0 and ctf_style_bonus == 0:
+        length_bonus = -3.0
+
     chi2 = english_chi_squared(text)
     if chi2 is not None:
         chi2_penalty = min(chi2 / 140.0, 6.0)
     elif len(text) >= 5:
-        # ตัวอักษรน้อยเกินไปจะคำนวณ chi2 ไม่ได้ (คืน None) แต่ถ้าสตริงยาว
-        # พอสมควรแล้วมีตัวอักษรน้อยขนาดนี้ (ส่วนใหญ่เป็นสัญลักษณ์/ตัวเลข
-        # จาก rot47 ที่สับไปมา) ก็ไม่ใช่ข้อความจริงเช่นกัน ต้องโดนปรับคะแนน
-        # ไม่ใช่ปล่อยผ่านฟรีๆ ไม่งั้นจะหนีบทลงโทษ chi2 ไปได้ง่ายๆ
         chi2_penalty = 1.5
     else:
         chi2_penalty = 0.0
@@ -814,32 +948,27 @@ def print_banner() -> None:
         "╚═════════════════════════════════════════════════════════════════════════════════════════════════╝"
     ]
 
-    # Compact two-line crypto summary (label + short summary below)
     crypto_label = "CRYPTO UTILITY — SECURE MULTIBASE DECODER 🔑"
     summary = "20+ encodings • smart heuristics • safe preview"
 
-    # Top separator before crypto block (with a blank line after)
     print(cyan("=" * width))
     print()
     print(color(crypto_label.center(width), "1;33"))
     print(color(summary.center(width), "1;33"))
     print()
 
-    # Stylized supported encodings with grouped columns for readability
     groups = [
         ("Binary", ["base2"]),
-        ("Radix/Base", ["base16", "base32", "base36", "base45", "base58", "base62", "base64", "base64url"]),
+        ("Radix/Base", ["base16", "base32", "base36", "base45", "base58", "base62", "base64", "base64url", "base100"]),
         ("High-enc", ["base85", "ascii85", "z85", "base91", "base92"]),
-        ("Text/Other", ["morse", "url", "rotN", "rot47", "atbash"]),
+        ("Text/Other", ["morse", "url", "quoted_printable", "rotN", "rot47", "atbash", "xor_singlebyte", "reverse"]),
     ]
     col_count = len(groups)
     col_width = max(20, width // col_count)
 
-    # Header row for groups
     header_row = "".join(cyan(title.center(col_width)) for title, _ in groups)
     print(header_row.center(width))
 
-    # Prepare wrapped item lines per column for neat alignment
     wrapped_lists: list[list[str]] = []
     for _, items in groups:
         joined = ", ".join(items)
@@ -860,13 +989,11 @@ def print_banner() -> None:
         print(green(line.center(width)))
     print()
 
-    # Commands (left) and credit (right) on the same bottom line
     commands_line = "🏠 q = quit 🧹 c = clear ❓  h/help/? = help   ⏎ empty = input"
     credit = "💳 Create by Mr.Suchakree Panyawong"
     gap = 4
     line = yellow(commands_line) + " " * gap + color(credit, "1;35")
     print(line)
-    # Bottom separator after commands
     print()
     print(cyan("=" * width))
 
@@ -876,6 +1003,12 @@ def print_help() -> None:
     print("Paste one encoded value per prompt. The tool will recursively try known decoders.")
     print("The decode chain is shown in the order used to decode.")
     print("Commands Quick: q = quit, c = clear terminal, h/help/? = show help, empty input = new prompt")
+    print()
+    print(divider("Tier-3 Manual Commands"))
+    print("These are NOT auto-chained (too ambiguous / false-positive prone). Invoke them explicitly:")
+    print(f"  {cyan('railfence')} <rails> <text>     e.g. railfence 3 WECRLTEERDSOEEFEAOCAIVDEN")
+    print(f"  {cyan('vigenere')} <key> <text>         e.g. vigenere LEMON ATTACKATDAWN")
+    print(f"  {cyan('columnar')} <key> <text>         e.g. columnar 4 WECRLTEERDSOEEFEAOCAIVDEN")
     print()
 
 def print_result(candidates: list[Candidate], show_candidates: bool, candidate_count: int = DEFAULT_CANDIDATE_COUNT) -> None:
@@ -899,9 +1032,14 @@ def print_result(candidates: list[Candidate], show_candidates: bool, candidate_c
 
 def decode_once(value: str, chain: tuple[str, ...] = ()) -> Iterable[tuple[str, str]]:
     for name, decoder in DECODERS:
+        if name in ONCE_PER_CHAIN_SCHEMES and name in chain:
+            continue
+        if is_always_succeeds_scheme(name) and total_substitution_count(chain) >= MAX_TOTAL_SUBSTITUTION:
+            continue
         try:
             decoded = decoder(value)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_once: decoder {name!r} raised: {e!r}")
             continue
         if not decoded:
             continue
@@ -910,15 +1048,14 @@ def decode_once(value: str, chain: tuple[str, ...] = ()) -> Iterable[tuple[str, 
             continue
         yield name, decoded
 
-    # เช็คว่า chain ปัจจุบันมี substitution cipher (rot-family/atbash) ต่อกัน
-    # ติดๆ กี่ชั้นแล้ว ถ้าครบเพดานแล้ว (MAX_CONSECUTIVE_SUBSTITUTION) ไม่ต้อง
-    # เปิดชั้นต่อไปด้วย substitution อีก เพราะมันคืนคำตอบได้เสมอ (reversible)
-    # ไม่มีทาง fail เอง ถ้าปล่อยไม่จำกัดจะขยายพื้นที่ค้นหาไปเรื่อยๆ ด้วยสตริง
-    # ที่ไม่มีความหมาย แล้วไปแย่งที่ในบีมจากคำตอบที่ถูกต้องจริงๆ
-    if trailing_substitution_run(chain) < MAX_CONSECUTIVE_SUBSTITUTION:
+    if (
+        trailing_substitution_run(chain) < MAX_CONSECUTIVE_SUBSTITUTION
+        and total_substitution_count(chain) < MAX_TOTAL_SUBSTITUTION
+    ):
         try:
             rot_candidates = decode_rot_all(value)
-        except Exception:
+        except Exception as e:
+            _log_debug(f"decode_once: rot generation failed: {e!r}")
             rot_candidates = []
         for name, decoded in rot_candidates:
             decoded = decoded.strip()
@@ -929,7 +1066,8 @@ def decode_once(value: str, chain: tuple[str, ...] = ()) -> Iterable[tuple[str, 
         for name, decoder in SUBSTITUTION_DECODERS:
             try:
                 decoded = decoder(value)
-            except Exception:
+            except Exception as e:
+                _log_debug(f"decode_once: substitution decoder {name!r} raised: {e!r}")
                 continue
             if not decoded:
                 continue
@@ -945,9 +1083,9 @@ def auto_decode(value: str, max_depth: int = 15, beam_size: int = 25) -> list[Ca
     }
     frontier = [best[start]]
 
-    # Conservative global pre-pass: if input appears URL-encoded, add an
-    # unquoted variant as an initial candidate so chains like URL -> base32 are
-    # discovered early without destroying original behavior.
+    if has_full_flag_pattern(start):
+        return sorted(best.values(), key=lambda item: (item.score, -len(item.chain)), reverse=True)
+
     try:
         if '%' in start or '+' in start:
             unq = urllib.parse.unquote(start)
@@ -955,7 +1093,8 @@ def auto_decode(value: str, max_depth: int = 15, beam_size: int = 25) -> list[Ca
             if unq and unq != start and not mostly_binary(unq) and unq not in best:
                 best[unq] = Candidate(text=unq, chain=("url",), score=score_text(unq) + VALIDATED_DECODE_BONUS)
                 frontier.append(best[unq])
-    except Exception:
+    except Exception as e:
+        _log_debug(f"auto_decode: pre-pass unquote failed: {e!r}")
         pass
 
     for _ in range(max_depth):
@@ -964,19 +1103,14 @@ def auto_decode(value: str, max_depth: int = 15, beam_size: int = 25) -> list[Ca
             for scheme, decoded in decode_once(candidate.text, candidate.chain):
                 if decoded in best:
                     continue
-                # ไม่มีการบวกโบนัสตามความยาว chain อีกต่อไป (ของเดิมคือ
-                # + len(candidate.chain) * 0.2) เพราะสร้างแรงจูงใจผิดๆ ให้
-                # ระบบชอบ chain ที่ยาวกว่าทั้งที่คุณภาพข้อความแย่กว่า
-                # (โดยเฉพาะกับ rot/rot47/atbash ที่ decode สำเร็จเสมอ)
-                # ตอนนี้ตัดสินจากคุณภาพข้อความล้วนๆ ผ่าน score_text()
                 base_score = score_text(decoded)
                 bonus = 0.0
-                # Give validated-decode bonus to decoders that reliably fail on invalid input
                 if gets_validated_bonus(scheme):
-                    bonus += VALIDATED_DECODE_BONUS
+                    if scheme in DENSE_LOW_CONFIDENCE_SCHEMES and len(decoded) < MIN_LENGTH_FOR_DENSE_BONUS:
+                        pass
+                    else:
+                        bonus += VALIDATED_DECODE_BONUS
                 else:
-                    # For weak schemes (base36/base58/base62), give a small
-                    # conditional bonus if the decoded text looks plausibly structured
                     if scheme in {"base36", "base58", "base62"}:
                         if (
                             len(decoded) >= 6
@@ -984,25 +1118,143 @@ def auto_decode(value: str, max_depth: int = 15, beam_size: int = 25) -> list[Ca
                             and not mostly_binary(decoded)
                             and ("_" in decoded or "{" in decoded or decoded.isalnum())
                         ):
-                            # stronger bonus for structured results (flags, underscores, mixed alnum)
                             bonus += VALIDATED_DECODE_BONUS
+
+                new_chain = candidate.chain + (scheme,)
+                # Small per-step cost for chains built out of "always
+                # succeeds" schemes (rot*/atbash/xor_singlebyte/reverse).
+                # These never fail, so a longer run of them is not stronger
+                # evidence of a correct path - it is more likely to be a
+                # coincidental detour. Deliberately NOT part of score_text()
+                # itself (that scores text quality in isolation); this
+                # penalizes the *chain shape* at the point a candidate is
+                # constructed, which is the right layer for it.
+                chain_penalty = total_substitution_count(new_chain) * ALWAYS_SUCCEEDS_STEP_PENALTY
 
                 new_candidate = Candidate(
                     text=decoded,
-                    chain=candidate.chain + (scheme,),
-                    score=base_score + bonus,
+                    chain=new_chain,
+                    score=base_score + bonus - chain_penalty,
                 )
                 best[decoded] = new_candidate
                 next_frontier.append(new_candidate)
+
+                if has_full_flag_pattern(decoded):
+                    # A full flag{...} match is about as unambiguous as this
+                    # tool ever gets - stronger evidence than score_text can
+                    # express through ordinary bonuses. Force it to actually
+                    # win the "Best Guess" slot instead of merely being
+                    # *included* in the sorted pool, where some unrelated
+                    # candidate (e.g. an untouched intermediate string that
+                    # coincidentally scored well) could still outrank it.
+                    winning_candidate = Candidate(
+                        text=new_candidate.text,
+                        chain=new_candidate.chain,
+                        score=new_candidate.score + FLAG_FOUND_OVERRIDE_BONUS,
+                    )
+                    best[decoded] = winning_candidate
+                    return sorted(best.values(), key=lambda item: (item.score, -len(item.chain)), reverse=True)
 
         if not next_frontier:
             break
 
         frontier = sorted(next_frontier, key=lambda item: item.score, reverse=True)[:beam_size]
 
-    # เรียงตามคะแนนก่อน แล้วถ้าคะแนนเท่ากันให้ chain สั้นกว่าชนะ (Occam's razor
-    # — คำตอบที่ต้องผ่านหลายชั้นน้อยกว่าน่าเชื่อถือกว่าเมื่อคุณภาพเท่ากัน)
     return sorted(best.values(), key=lambda item: (item.score, -len(item.chain)), reverse=True)
+
+def railfence_decode(text: str, rails: int) -> str | None:
+    if rails < 2 or rails >= max(len(text), 2):
+        return None
+    pattern = list(range(rails)) + list(range(rails - 2, 0, -1))
+    if not pattern:
+        return None
+    rail_index = [pattern[i % len(pattern)] for i in range(len(text))]
+    counts = Counter(rail_index)
+    slots = {r: [] for r in range(rails)}
+    pos = 0
+    for r in range(rails):
+        for _ in range(counts.get(r, 0)):
+            slots[r].append(text[pos])
+            pos += 1
+    cursors = {r: 0 for r in range(rails)}
+    out = []
+    for r in rail_index:
+        out.append(slots[r][cursors[r]])
+        cursors[r] += 1
+    return "".join(out)
+
+def vigenere_decode(text: str, key: str) -> str | None:
+    key = re.sub(r"[^A-Za-z]", "", key)
+    if not key:
+        return None
+    key_upper = key.upper()
+    out = []
+    ki = 0
+    for ch in text:
+        if ch.isalpha():
+            shift = ord(key_upper[ki % len(key_upper)]) - ord('A')
+            base = ord('A') if ch.isupper() else ord('a')
+            out.append(chr((ord(ch) - base - shift) % 26 + base))
+            ki += 1
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def columnar_decode(text: str, key_width: int) -> str | None:
+    if key_width < 2 or key_width >= max(len(text), 2):
+        return None
+    n = len(text)
+    num_rows = math.ceil(n / key_width)
+    num_full_cols = n % key_width or key_width
+    col_lengths = [num_rows if c < num_full_cols else num_rows - 1 for c in range(key_width)]
+    cols = []
+    pos = 0
+    for length in col_lengths:
+        cols.append(text[pos:pos + length])
+        pos += length
+    out = []
+    for r in range(num_rows):
+        for c in range(key_width):
+            if r < len(cols[c]):
+                out.append(cols[c][r])
+    return "".join(out)
+
+def handle_manual_command(raw_input: str) -> bool:
+    parts = raw_input.split(None, 2)
+    if len(parts) < 3:
+        return False
+    cmd = parts[0].lower()
+
+    if cmd == "railfence":
+        try:
+            rails = int(parts[1])
+        except ValueError:
+            return False
+        result = railfence_decode(parts[2], rails)
+        print(divider("Rail Fence Result"))
+        print(green(result) if result else dim("(invalid rail count for this input length)"))
+        print()
+        return True
+
+    if cmd == "vigenere":
+        result = vigenere_decode(parts[2], parts[1])
+        print(divider("Vigenère Result"))
+        print(green(result) if result else dim("(invalid key)"))
+        print()
+        return True
+
+    if cmd == "columnar":
+        try:
+            width = int(parts[1])
+        except ValueError:
+            return False
+        result = columnar_decode(parts[2], width)
+        print(divider("Columnar Transposition Result"))
+        print(green(result) if result else dim("(invalid key width for this input length)"))
+        print()
+        return True
+
+    return False
 
 def read_payload(args: argparse.Namespace) -> str:
     if args.file:
@@ -1014,7 +1266,6 @@ def read_payload(args: argparse.Namespace) -> str:
 
 def run_interactive(max_depth: int, beam_size: int, show_candidates: bool) -> None:
     print_banner()
-
     while True:
         print(divider())
         try:
@@ -1023,7 +1274,6 @@ def run_interactive(max_depth: int, beam_size: int, show_candidates: bool) -> No
             print()
             print(dim("bye"))
             return
-
         if not payload:
             continue
         if payload.lower() in {"q", "quit", "exit"}:
@@ -1035,7 +1285,8 @@ def run_interactive(max_depth: int, beam_size: int, show_candidates: bool) -> No
         if payload.lower() in {"h", "help", "?"}:
             print_help()
             continue
-
+        if handle_manual_command(payload):
+            continue
         candidates = auto_decode(payload, max_depth=max_depth, beam_size=beam_size)
         print_result(candidates, show_candidates=show_candidates)
         print()
