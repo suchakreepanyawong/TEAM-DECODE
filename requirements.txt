@@ -1,0 +1,6 @@
+# Minimal runtime requirements (optional components listed)
+# zstandard (optional) used for zstd compression support
+zstandard>=0.19.0
+
+# Tools for running tests locally
+pytest>=7.0
